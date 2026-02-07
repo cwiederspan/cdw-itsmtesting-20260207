@@ -71,6 +71,9 @@ Use this information to update the .github/copilot-instructions.md file to suppo
 # It is good to do this right away
 az login
 
+# Possible GitHub login needed
+gh auth login
+
 # Launch GitHub Copilot CLI
 copilot --yolo
 
@@ -95,6 +98,6 @@ copilot --yolo
 ### Step 3: Possible MCP Servers
 
 - **Azure MCP** - `npx -y @azure/mcp@latest server start`
-- **Microsoft Fabric** - `npx -y @microsoft/fabric-mcp@latest server start --mode all   `
+- **Microsoft Fabric** - `npx -y @microsoft/fabric-mcp@latest server start --mode all`
 - **Playwright** - `npx -y @playwright/mcp@latest`
 - **Azure DevOps** - `npx -y @azure-devops/mcp your-org-name`
