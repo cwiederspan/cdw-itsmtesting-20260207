@@ -45,72 +45,126 @@ This project restores an ITSM database from a `.bacpac` file into Azure SQL Data
 
 ### Technology Stack
 - **Azure CLI** — Resource provisioning and management
-- **SqlPackage** — BACPAC import (v170.x required for Sql170 schema)
-- **.NET 8** — Required runtime for SqlPackage
+- **Azure Container Instances (ACI)** — Ephemeral compute for running the bacpac import inside Azure
+- **Azure Container Registry (ACR)** — Temporary image registry for the import container (deleted after use)
+- **SqlPackage** — BACPAC import tool (runs inside the ACI container)
 - **Microsoft Fabric** — Data mirroring destination
 
-### Azure Resources Required
+### Azure Resources (Persistent)
 
 | Resource | Name | Notes |
 |---|---|---|
 | Resource Group | `cdw-itsmtesting-20260207-v01` | Location: `westus2` |
-| Storage Account | `itsm20260207` | For bacpac staging, Entra auth only |
-| Blob Container | `bacpaccontainer` | Holds uploaded ITSM.bacpac |
 | Azure SQL Server | `itsm20260207v01` | Entra-only auth, System Assigned MI |
-| Azure SQL Database | `ITSM` | General Purpose Serverless, no redundancy |
+| Azure SQL Database | `ITSM` | General Purpose Serverless (GP_S_Gen5_1), no redundancy |
+
+### Azure Resources (Ephemeral — created during import, deleted after)
+
+| Resource | Name | Purpose |
+|---|---|---|
+| Container Registry | `itsm20260207acr` | Hosts the import container image |
+| Container Instance | `bacpac-import` | Runs SqlPackage inside Azure |
+| User-Assigned MI | `bacpac-import-identity` | Authenticates ACI to SQL Server |
 
 ### Workflow Steps
 
 #### Step 1: Create Azure SQL Infrastructure
-1. Create resource group
-2. Create storage account + blob container
-3. Upload `ITSM.bacpac` to blob storage (using Entra auth)
-4. Create Azure SQL Server (Entra-only, system managed identity)
-5. Create empty database (General Purpose Serverless SKU)
-6. Configure firewall (client IP + Azure services)
-7. Assign RBAC roles for managed identity
+1. Run `az config set extension.use_dynamic_install=yes_without_prompt`
+2. Create resource group (`cdw-itsmtesting-20260207-v01` in `westus2`)
+3. Create Azure SQL Server (`itsm20260207v01`) with:
+   - Entra-only authentication (`--enable-ad-only-auth`)
+   - System Assigned Managed Identity (`--assign-identity --identity-type SystemAssigned`)
+   - Current user as AD admin (`--external-admin-principal-type User`)
+4. Create empty database (`ITSM`) with:
+   - General Purpose Serverless SKU (`--edition GeneralPurpose --compute-model Serverless --family Gen5 --capacity 1`)
+   - Auto-pause after 60 min (`--auto-pause-delay 60`)
+   - Local backup redundancy (`--backup-storage-redundancy Local`)
+5. Configure firewall rules:
+   - Allow current client IP (`curl -s https://ifconfig.me`)
+   - Allow Azure services (`0.0.0.0` to `0.0.0.0`)
 
-#### Step 2: Import BACPAC via SqlPackage
-1. Install SqlPackage 170.x and .NET 8
-2. Obtain access token via `az account get-access-token --resource https://database.windows.net/`
-3. Run `sqlpackage /Action:Import /SourceFile:./ITSM.bacpac /TargetServerName:itsm20260207v01.database.windows.net /TargetDatabaseName:ITSM /AccessToken:<token>`
-4. Import takes ~55 minutes for 145MB bacpac — run in background
+#### Step 2: Import BACPAC via ACI + SqlPackage
+This is the proven approach. Do NOT try to run SqlPackage locally — it will likely fail due to token expiry over slow networks.
+
+1. **Create ephemeral resources:**
+   - Create a user-assigned managed identity (`bacpac-import-identity`)
+   - Set the MI as SQL Server AD admin (note: this temporarily removes your user as admin)
+   - Wait 60 seconds for the admin assignment to propagate
+   - Create an ACR (`itsm20260207acr`, Basic SKU, admin enabled)
+
+2. **Build the import container:**
+   - Create a build context directory with:
+     - `Dockerfile` — Based on `mcr.microsoft.com/dotnet/runtime:8.0`, installs SqlPackage (via `https://aka.ms/sqlpackage-linux`) and Azure CLI, copies the bacpac file
+     - `import.sh` — Logs in via managed identity (`az login --identity --client-id <CLIENT_ID>`), gets an access token for `https://database.windows.net/`, runs `sqlpackage /Action:Import`
+     - `ITSM.bacpac` — The bacpac file
+   - Build using ACR Tasks: `az acr build --registry <acr> --image bacpac-import:latest .`
+
+3. **Run the import:**
+   - Create ACI with: `--assign-identity <MI_RESOURCE_ID>`, `--os-type Linux`, `--cpu 2 --memory 4`, `--restart-policy Never`
+   - Pass environment variables: `SQL_SERVER`, `SQL_DATABASE`, `MI_CLIENT_ID`
+   - Monitor with: `az container logs --name bacpac-import --resource-group <rg>`
+   - Expected completion: ~21 minutes for 145MB bacpac on serverless SKU
+
+4. **Clean up after success:**
+   - Restore original user as SQL Server AD admin
+   - Delete ACI: `az container delete --name bacpac-import`
+   - Delete ACR: `az acr delete --name itsm20260207acr`
+   - Delete managed identity: `az identity delete --name bacpac-import-identity`
 
 #### Step 3: Mirror to Microsoft Fabric
 1. Configure Fabric mirroring for ITSM database tables
 2. Details depend on Fabric workspace configuration
 
-### Import Strategy
-**`az sql db import` does NOT support Entra-only authentication.** Use SqlPackage instead:
-1. Upload .bacpac to Azure Blob Storage for staging
-2. Create empty database with serverless SKU
-3. Use `sqlpackage /Action:Import` with `/AccessToken` for Entra auth
-4. Import takes ~55 minutes for a 145MB bacpac file
+---
+
+## Key Design Decisions
+
+### Why ACI instead of running SqlPackage locally?
+- **`az sql db import` does NOT support Entra-only authentication** — It requires a SQL admin password, which is unavailable when Entra-only auth is enforced.
+- **SqlPackage only reads local files** — It cannot import directly from Azure Blob Storage URLs, so blob staging adds no value.
+- **Azure AD access tokens expire in ~75-87 minutes** — Running SqlPackage locally over home internet takes ~90+ min for a 145MB bacpac, exceeding the token lifetime. From a GitHub Codespace it takes ~45-55 min (tight but possible).
+- **ACI runs inside Azure's network** — The same import completes in ~21 minutes on the cheapest serverless SKU, well within token lifetime. No need to scale up the database.
+
+### Why a user-assigned managed identity?
+- ACI with system-assigned MI gets a new principal ID each time it's recreated, requiring the SQL admin to be updated each time.
+- A user-assigned MI keeps a stable principal ID across ACI delete/recreate cycles, which is essential since ACI with `--restart-policy Never` cannot be restarted.
+
+### Why not use an Entra ID group as SQL admin?
+- This would be the ideal approach: create a group, add both your user and the MI, set the group as admin. This avoids swapping the admin back and forth.
+- Not implemented yet — would be an improvement for future iterations.
 
 ---
 
 ## Lessons Learned & Best Practices
 
-### Common Pitfalls
+### Import Strategy
+1. **ACI is the recommended approach for bacpac import** — Package SqlPackage + bacpac into a Docker image, run as ACI in the same Azure region as the SQL server. Import completes in ~21 min on serverless SKU.
+2. **SqlPackage cannot resume a failed import** — A failed import leaves the database partially populated. You must `az sql db delete` and `az sql db create` before retrying.
+3. **SQL admin changes take ~60 seconds to propagate** — Always wait after updating the AD admin before the ACI attempts to connect.
+4. **Use `--client-id` (not `--username`) for user-assigned MI** — `az login --identity --username` is deprecated.
+5. **ACI with `--restart-policy Never` cannot be restarted** — Must delete and recreate. Use a user-assigned MI so the identity persists.
 
-1. **Storage account key auth may be disabled by Azure Policy** — Use Entra auth with role assignments instead of storage keys. Use `--auth-mode login --as-user` for blob SAS tokens.
-2. **`az sql db import` does NOT work with Entra-only auth** — It requires SQL admin password. Use SqlPackage with `/AccessToken` instead.
-3. **SqlPackage version must match bacpac schema version** — SQL Server 2022 bacpac (Sql170) requires SqlPackage 170.x.
-4. **SqlPackage 170.2.70 requires .NET 8.0.20** — Use SqlPackage 170.0.94 if you only have .NET 8.0.15.
-5. **Role assignments take ~60 seconds to propagate** — Wait before using newly assigned permissions.
-6. **User delegation SAS tokens work when key auth is disabled** — Use `--auth-mode login --as-user` for blob SAS.
-7. **Import of 145MB bacpac takes ~55 minutes** — Run in background and plan accordingly.
-8. **Azure CLI extensions may prompt for installation** — Run `az config set extension.use_dynamic_install=yes_without_prompt` first.
+### Azure SQL
+6. **Entra-only auth blocks `az sql db import`** — This command requires SQL auth (username/password). Use SqlPackage with `/AccessToken` instead.
+7. **Azure AD tokens expire in ~75-87 minutes** — Ensure the import can complete within this window. ACI approach handles this easily.
+8. **SQL Server supports one AD admin (user or group)** — Use an Entra group to avoid swapping admins. The group can contain both human users and managed identities.
+
+### SqlPackage
+9. **SqlPackage version must match bacpac schema** — SQL Server 2022 bacpac (Sql170) requires SqlPackage 170.x.
+10. **Use the standalone Linux zip for containers** — Download from `https://aka.ms/sqlpackage-linux` rather than the .NET tool install.
+11. **SqlPackage only reads local files** — No support for Azure Blob Storage URLs as source.
+
+### General Azure
+12. **Run `az config set extension.use_dynamic_install=yes_without_prompt`** — Prevents interactive prompts for CLI extension installs.
+13. **Register resource providers before first use** — `Microsoft.ContainerRegistry` and `Microsoft.ContainerInstance` may not be registered on the subscription. Use `az provider register --namespace <ns> --wait`.
+14. **Blob storage is unnecessary for this workflow** — Since SqlPackage can't use blob URLs and `az sql db import` can't use Entra-only auth, staging the bacpac in blob storage adds no value.
 
 ### Success Markers
 
-- [ ] Resource group created
-- [ ] Storage account and container created
-- [ ] ITSM.bacpac uploaded to blob storage
-- [ ] SQL Server created with Entra-only auth and system MI
-- [ ] Database created with serverless SKU
-- [ ] Firewall configured
-- [ ] RBAC roles assigned
-- [ ] SqlPackage installed (v170.x)
-- [ ] BACPAC imported successfully
+- [x] Resource group created
+- [x] SQL Server created with Entra-only auth and system MI
+- [x] Database created with serverless SKU
+- [x] Firewall configured (client IP + Azure services)
+- [x] BACPAC imported successfully via ACI (~21 min)
+- [x] Ephemeral resources cleaned up (ACR, ACI, MI)
 - [ ] Fabric mirroring configured
