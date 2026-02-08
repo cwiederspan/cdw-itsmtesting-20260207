@@ -54,15 +54,16 @@ This project restores an ITSM database from a `.bacpac` file into Azure SQL Data
 
 | Resource | Name | Notes |
 |---|---|---|
-| Resource Group | `cdw-itsmtesting-20260207-v01` | Location: `westus2` |
-| Azure SQL Server | `itsm20260207v01` | Entra-only auth, System Assigned MI |
+| Entra ID Group | `itsm-sql-admins` | SQL admin group — **keep this even when deleting resource groups** |
+| Resource Group | `cdw-itsmtesting-20260207-v02` | Location: `westus2` |
+| Azure SQL Server | `itsm20260207v02` | Entra-only auth, System Assigned MI |
 | Azure SQL Database | `ITSM` | General Purpose Serverless (GP_S_Gen5_1), no redundancy |
 
 ### Azure Resources (Ephemeral — created during import, deleted after)
 
 | Resource | Name | Purpose |
 |---|---|---|
-| Container Registry | `itsm20260207acr` | Hosts the import container image |
+| Container Registry | `itsm20260207v02acr` | Hosts the import container image |
 | Container Instance | `bacpac-import` | Runs SqlPackage inside Azure |
 | User-Assigned MI | `bacpac-import-identity` | Authenticates ACI to SQL Server |
 
@@ -70,16 +71,19 @@ This project restores an ITSM database from a `.bacpac` file into Azure SQL Data
 
 #### Step 1: Create Azure SQL Infrastructure
 1. Run `az config set extension.use_dynamic_install=yes_without_prompt`
-2. Create resource group (`cdw-itsmtesting-20260207-v01` in `westus2`)
-3. Create Azure SQL Server (`itsm20260207v01`) with:
+2. Check if Entra group `itsm-sql-admins` already exists (`az ad group show --group itsm-sql-admins`)
+   - If not, create it: `az ad group create --display-name itsm-sql-admins --mail-nickname itsm-sql-admins`
+   - Ensure the current user is a member; add if not: `az ad group member add --group itsm-sql-admins --member-id <USER_OID>`
+3. Create resource group (`cdw-itsmtesting-20260207-v02` in `westus2`)
+4. Create Azure SQL Server (`itsm20260207v02`) with:
    - Entra-only authentication (`--enable-ad-only-auth`)
    - System Assigned Managed Identity (`--assign-identity --identity-type SystemAssigned`)
-   - Current user as AD admin (`--external-admin-principal-type User`)
-4. Create empty database (`ITSM`) with:
+   - The Entra group as AD admin (`--external-admin-principal-type Group`)
+5. Create empty database (`ITSM`) with:
    - General Purpose Serverless SKU (`--edition GeneralPurpose --compute-model Serverless --family Gen5 --capacity 1`)
    - Auto-pause after 60 min (`--auto-pause-delay 60`)
    - Local backup redundancy (`--backup-storage-redundancy Local`)
-5. Configure firewall rules:
+6. Configure firewall rules:
    - Allow current client IP (`curl -s https://ifconfig.me`)
    - Allow Azure services (`0.0.0.0` to `0.0.0.0`)
 
@@ -88,9 +92,9 @@ This is the proven approach. Do NOT try to run SqlPackage locally — it will li
 
 1. **Create ephemeral resources:**
    - Create a user-assigned managed identity (`bacpac-import-identity`)
-   - Set the MI as SQL Server AD admin (note: this temporarily removes your user as admin)
-   - Wait 60 seconds for the admin assignment to propagate
-   - Create an ACR (`itsm20260207acr`, Basic SKU, admin enabled)
+   - Add the MI to the `itsm-sql-admins` Entra group (no need to swap the SQL admin)
+   - Wait 60 seconds for the group membership to propagate
+   - Create an ACR (`itsm20260207v02acr`, Basic SKU, admin enabled)
 
 2. **Build the import container:**
    - Create a build context directory with:
@@ -106,9 +110,9 @@ This is the proven approach. Do NOT try to run SqlPackage locally — it will li
    - Expected completion: ~21 minutes for 145MB bacpac on serverless SKU
 
 4. **Clean up after success:**
-   - Restore original user as SQL Server AD admin
+   - Remove the MI from the `itsm-sql-admins` Entra group
    - Delete ACI: `az container delete --name bacpac-import`
-   - Delete ACR: `az acr delete --name itsm20260207acr`
+   - Delete ACR: `az acr delete --name itsm20260207v02acr`
    - Delete managed identity: `az identity delete --name bacpac-import-identity`
 
 #### Step 3: Mirror to Microsoft Fabric
@@ -129,9 +133,11 @@ This is the proven approach. Do NOT try to run SqlPackage locally — it will li
 - ACI with system-assigned MI gets a new principal ID each time it's recreated, requiring the SQL admin to be updated each time.
 - A user-assigned MI keeps a stable principal ID across ACI delete/recreate cycles, which is essential since ACI with `--restart-policy Never` cannot be restarted.
 
-### Why not use an Entra ID group as SQL admin?
-- This would be the ideal approach: create a group, add both your user and the MI, set the group as admin. This avoids swapping the admin back and forth.
-- Not implemented yet — would be an improvement for future iterations.
+### Why an Entra ID group as SQL admin?
+- SQL Server supports a single AD admin, which can be a user or a group.
+- Using a group (`itsm-sql-admins`) allows both your user and the ACI managed identity to have admin access simultaneously.
+- No need to swap the admin back and forth — just add/remove members from the group.
+- The group persists across resource recreations, making the workflow more robust.
 
 ---
 
@@ -147,7 +153,7 @@ This is the proven approach. Do NOT try to run SqlPackage locally — it will li
 ### Azure SQL
 6. **Entra-only auth blocks `az sql db import`** — This command requires SQL auth (username/password). Use SqlPackage with `/AccessToken` instead.
 7. **Azure AD tokens expire in ~75-87 minutes** — Ensure the import can complete within this window. ACI approach handles this easily.
-8. **SQL Server supports one AD admin (user or group)** — Use an Entra group to avoid swapping admins. The group can contain both human users and managed identities.
+8. **Use an Entra ID group as SQL Server admin** — Create a security group (e.g., `itsm-sql-admins`), add your user to it, and set the group as the SQL admin. During import, add the ACI managed identity to the same group. This avoids swapping the admin back and forth.
 
 ### SqlPackage
 9. **SqlPackage version must match bacpac schema** — SQL Server 2022 bacpac (Sql170) requires SqlPackage 170.x.
@@ -161,10 +167,10 @@ This is the proven approach. Do NOT try to run SqlPackage locally — it will li
 
 ### Success Markers
 
-- [x] Resource group created
-- [x] SQL Server created with Entra-only auth and system MI
-- [x] Database created with serverless SKU
-- [x] Firewall configured (client IP + Azure services)
-- [x] BACPAC imported successfully via ACI (~21 min)
-- [x] Ephemeral resources cleaned up (ACR, ACI, MI)
+- [ ] Resource group created
+- [ ] SQL Server created with Entra-only auth and system MI
+- [ ] Database created with serverless SKU
+- [ ] Firewall configured (client IP + Azure services)
+- [ ] BACPAC imported successfully via ACI
+- [ ] Ephemeral resources cleaned up (ACR, ACI, MI)
 - [ ] Fabric mirroring configured
