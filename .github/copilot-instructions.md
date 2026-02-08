@@ -55,6 +55,9 @@ This project restores an ITSM database from a `.bacpac` file into Azure SQL Data
 | Resource | Name | Notes |
 |---|---|---|
 | Entra ID Group | `itsm-sql-admins` | SQL admin group — **keep this even when deleting resource groups** |
+| Fabric Workspace | `My ITSM Workspace` | ID: `6a55d22a-ae85-4707-89fd-ec4e0e261d17` — **keep across teardowns** |
+| Fabric Connection | `ITSM-AzureSQL-Connection` | ID: `76f3ff4c-19e2-4070-b0c8-cb6b478fa198` — recreate if SQL server changes |
+| Fabric Capacity | `itsmfabric20260207` | F2 SKU, West US 2 — **lives in the resource group** |
 | Resource Group | `cdw-itsmtesting-20260207-v02` | Location: `westus2` |
 | Azure SQL Server | `itsm20260207v02` | Entra-only auth, System Assigned MI |
 | Azure SQL Database | `ITSM` | General Purpose Serverless (GP_S_Gen5_1), no redundancy |
@@ -116,8 +119,145 @@ This is the proven approach. Do NOT try to run SqlPackage locally — it will li
    - Delete managed identity: `az identity delete --name bacpac-import-identity`
 
 #### Step 3: Mirror to Microsoft Fabric
-1. Configure Fabric mirroring for ITSM database tables
-2. Details depend on Fabric workspace configuration
+**Prerequisites (automated in Step 1):**
+- SQL Server System Assigned Managed Identity (SAMI) must be enabled and be the primary identity
+- "Allow Azure services" firewall rule must be configured
+
+**Fabric capacity prerequisite:**
+- Fabric mirroring requires a **Fabric capacity** (F SKU). Premium Per User (PPU/PP3) does NOT work.
+- Create an F2 capacity (smallest, ~$262/month) in the same resource group:
+  ```bash
+  az fabric capacity create \
+    --resource-group cdw-itsmtesting-20260207-v02 \
+    --capacity-name itsmfabric20260207 \
+    --location westus2 \
+    --sku "{name:F2,tier:Fabric}" \
+    --administration "{members:[youruser@domain.com]}"
+  ```
+  Note: This will auto-register the `Microsoft.Fabric` resource provider if needed (~2-3 min).
+
+**Database setup (run once after import):**
+1. Create a contained database user for your Entra identity with mirroring permissions:
+   ```sql
+   CREATE USER [youruser@domain.com] FROM EXTERNAL PROVIDER;
+   GRANT SELECT, ALTER ANY EXTERNAL MIRROR, VIEW DATABASE PERFORMANCE STATE, VIEW DATABASE SECURITY STATE TO [youruser@domain.com];
+   ```
+
+**Configure mirroring via Fabric REST API:**
+1. **Create a Fabric workspace** (if not already created):
+   ```bash
+   TOKEN=$(az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv)
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"displayName": "My ITSM Workspace"}' \
+     "https://api.fabric.microsoft.com/v1/workspaces"
+   ```
+   Record the workspace ID from the response.
+
+2. **Assign workspace to the F2 capacity:**
+   ```bash
+   # Get the F2 capacity ID
+   curl -s -H "Authorization: Bearer $TOKEN" "https://api.fabric.microsoft.com/v1/capacities"
+   # Assign it
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"capacityId": "<F2_CAPACITY_ID>"}' \
+     "https://api.fabric.microsoft.com/v1/workspaces/<WORKSPACE_ID>/assignToCapacity"
+   ```
+
+3. **Enable workspace identity** (required for WorkspaceIdentity auth):
+   ```bash
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Length: 0" \
+     "https://api.fabric.microsoft.com/v1/workspaces/<WORKSPACE_ID>/provisionIdentity"
+   ```
+   Wait ~20 seconds for provisioning. The workspace identity name matches the workspace name.
+
+4. **Create a Fabric connection** to the Azure SQL Database:
+   ```bash
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{
+       "connectivityType": "ShareableCloud",
+       "displayName": "ITSM-AzureSQL-Connection",
+       "connectionDetails": {
+         "type": "SQL", "creationMethod": "SQL",
+         "parameters": [
+           {"dataType": "Text", "name": "server", "value": "itsm20260207v02.database.windows.net"},
+           {"dataType": "Text", "name": "database", "value": "ITSM"}
+         ]
+       },
+       "privacyLevel": "Organizational",
+       "credentialDetails": {
+         "singleSignOnType": "None", "connectionEncryption": "NotEncrypted",
+         "skipTestConnection": false,
+         "credentials": {"credentialType": "WorkspaceIdentity"}
+       }
+     }' "https://api.fabric.microsoft.com/v1/connections"
+   ```
+   Record the connection ID from the response.
+
+5. **Create a SQL user for the workspace identity** (the workspace identity name matches the workspace name):
+   ```sql
+   CREATE USER [My ITSM Workspace] FROM EXTERNAL PROVIDER;
+   GRANT SELECT, ALTER ANY EXTERNAL MIRROR, VIEW DATABASE PERFORMANCE STATE, VIEW DATABASE SECURITY STATE TO [My ITSM Workspace];
+   ```
+
+6. **Create the mirrored database** using the connection ID:
+   ```bash
+   # Build the mirroring.json payload (mirrors all tables)
+   PAYLOAD=$(echo -n '{
+     "properties": {
+       "source": {
+         "type": "AzureSqlDatabase",
+         "typeProperties": {"connection": "<CONNECTION_ID>", "database": "ITSM"}
+       },
+       "target": {
+         "type": "MountedRelationalDatabase",
+         "typeProperties": {"defaultSchema": "dbo", "format": "Delta"}
+       }
+     }
+   }' | base64 -w0)
+
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d "{
+       \"displayName\": \"ITSM Mirrored Database\",
+       \"description\": \"Mirror of ITSM Azure SQL Database\",
+       \"definition\": {
+         \"parts\": [{\"path\": \"mirroring.json\", \"payload\": \"$PAYLOAD\", \"payloadType\": \"InlineBase64\"}]
+       }
+     }" "https://api.fabric.microsoft.com/v1/workspaces/<WORKSPACE_ID>/mirroredDatabases"
+   ```
+   Record the mirrored database ID from the response.
+
+7. **Grant the SQL Server SAMI access** to the mirrored database:
+   - Get the SQL Server SAMI object ID: `az sql server show --name itsm20260207v02 --resource-group cdw-itsmtesting-20260207-v02 --query identity.principalId -o tsv`
+   - Add the SAMI as a workspace contributor via the Fabric API:
+     ```bash
+     curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+       -d '{"principal": {"id": "<SAMI_OID>", "type": "ServicePrincipal"}, "role": "Contributor"}' \
+       "https://api.fabric.microsoft.com/v1/workspaces/<WORKSPACE_ID>/roleAssignments"
+     ```
+
+8. **Start mirroring:**
+   ```bash
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Length: 0" \
+     "https://api.fabric.microsoft.com/v1/workspaces/<WORKSPACE_ID>/mirroredDatabases/<MIRRORED_DB_ID>/startMirroring"
+   ```
+
+9. **Monitor mirroring status:**
+   ```bash
+   # Overall status (expect "Running")
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Length: 0" \
+     "https://api.fabric.microsoft.com/v1/workspaces/<WORKSPACE_ID>/mirroredDatabases/<MIRRORED_DB_ID>/getMirroringStatus"
+
+   # Per-table status
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Length: 0" \
+     "https://api.fabric.microsoft.com/v1/workspaces/<WORKSPACE_ID>/mirroredDatabases/<MIRRORED_DB_ID>/getTablesMirroringStatus"
+   ```
+
+**Alternative: Configure mirroring via Fabric portal:**
+1. Open [fabric.microsoft.com](https://fabric.microsoft.com) and navigate to your workspace
+2. Select **Create** → **Mirrored Azure SQL Database** (under Data Warehouse section)
+3. Under **New sources**, select **Azure SQL Database**
+4. Enter: Server `itsm20260207v02.database.windows.net`, Database `ITSM`, Auth: Organization account
+5. Select **Connect** → select tables → **Mirror database**
 
 ---
 
@@ -165,12 +305,22 @@ This is the proven approach. Do NOT try to run SqlPackage locally — it will li
 13. **Register resource providers before first use** — `Microsoft.ContainerRegistry` and `Microsoft.ContainerInstance` may not be registered on the subscription. Use `az provider register --namespace <ns> --wait`.
 14. **Blob storage is unnecessary for this workflow** — Since SqlPackage can't use blob URLs and `az sql db import` can't use Entra-only auth, staging the bacpac in blob storage adds no value.
 
+### Fabric Mirroring
+15. **Fabric mirroring requires an F SKU capacity** — PPU (Premium Per User / PP3) does NOT work for Fabric workloads. Create an F2 capacity via `az fabric capacity create` (~$262/month). Trial capacity (F4/F64) also works if available on your tenant.
+16. **The entire mirroring workflow can be done via REST API** — Create workspace, assign capacity, provision workspace identity, create connection, mirrored database, start mirroring, and monitor status all via `https://api.fabric.microsoft.com/v1/`. No portal required.
+17. **Use `WorkspaceIdentity` credential type for connections** — OAuth2 credential type requires interactive browser auth; `WorkspaceIdentity` works from CLI/API without browser interaction. Must enable workspace identity first via `provisionIdentity` API.
+18. **The workspace identity needs a SQL database user** — Create a contained user with the workspace name (e.g., `CREATE USER [My ITSM Workspace] FROM EXTERNAL PROVIDER`) and grant mirroring permissions. Without this, mirroring fails with `SqlAuthenticationFailure`.
+19. **SQL Server SAMI needs Contributor role on the Fabric workspace** — After creating the mirrored database, grant the SQL Server's System Assigned MI the Contributor role on the workspace via the `roleAssignments` API. This allows the SAMI to write mirrored data.
+20. **Fabric workspace and Entra group persist across teardowns** — Like the `itsm-sql-admins` Entra group, the Fabric workspace and connection can be kept when deleting Azure resource groups. The F2 capacity lives in the resource group and will be deleted with it.
+21. **`Microsoft.Fabric` provider may need registration** — First `az fabric capacity create` auto-registers the provider, but it takes ~2-3 minutes.
+
 ### Success Markers
 
-- [ ] Resource group created
-- [ ] SQL Server created with Entra-only auth and system MI
-- [ ] Database created with serverless SKU
-- [ ] Firewall configured (client IP + Azure services)
-- [ ] BACPAC imported successfully via ACI
-- [ ] Ephemeral resources cleaned up (ACR, ACI, MI)
-- [ ] Fabric mirroring configured
+- [x] Resource group created
+- [x] SQL Server created with Entra-only auth and system MI
+- [x] Database created with serverless SKU
+- [x] Firewall configured (client IP + Azure services)
+- [x] BACPAC imported successfully via ACI
+- [x] Ephemeral resources cleaned up (ACR, ACI, MI)
+- [x] Fabric F2 capacity created and workspace assigned
+- [x] Fabric mirroring configured and running (500 tables)
